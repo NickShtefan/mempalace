@@ -3,8 +3,8 @@
 Returns a ChromaDB-compatible embedding function bound to a user-selected
 ONNX Runtime execution provider.
 
-Two embedding models are available, selected via ``MEMPALACE_EMBEDDING_MODEL``
-or ``embedding_model`` in ``~/.mempalace/config.json``:
+The model is selected via ``MEMPALACE_EMBEDDING_MODEL`` or
+``embedding_model`` in ``~/.mempalace/config.json``:
 
 * ``minilm`` (default) — ``all-MiniLM-L6-v2``, 384-dim, English-only training.
   ChromaDB's default; what every existing palace was built with.
@@ -15,6 +15,17 @@ or ``embedding_model`` in ``~/.mempalace/config.json``:
   model is lazy-downloaded from HuggingFace on first use. Switching models
   on an existing palace requires ``mempalace repair rebuild-index``
   (different vector space).
+* any other value — treated as a `sentence-transformers
+  <https://www.sbert.net/>`_ model id (a HuggingFace repo id such as
+  ``intfloat/multilingual-e5-base`` or ``BAAI/bge-m3``, or a local
+  checkpoint path) and served through chromadb's
+  ``SentenceTransformerEmbeddingFunction``. Requires
+  ``pip install mempalace[multilingual]``; a missing dependency raises an
+  actionable ``ImportError`` instead of silently falling back to the
+  default model (a palace stamped with one model but embedded with
+  another is exactly the corruption the identity check exists to stop).
+  This path runs on torch, not ONNX Runtime — see
+  :func:`_resolve_torch_device` for how ``embedding_device`` maps.
 
 Supported devices (env ``MEMPALACE_EMBEDDING_DEVICE`` or ``embedding_device``
 in ``~/.mempalace/config.json``):
@@ -31,8 +42,11 @@ rather than hard-failing — mining must still work on a laptop without CUDA.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
+import platform
+import sys
 import threading
 from typing import Optional
 
@@ -57,12 +71,226 @@ _AUTO_ORDER = [
     ("DmlExecutionProvider", "dml"),
 ]
 
+# Model ids resolved by this module's own ONNX classes. Anything else is a
+# sentence-transformers model id (HF repo or local path).
+_BUILTIN_MODELS = {"minilm", "embeddinggemma"}
+
+# Config device vocabulary (ONNX-EP-shaped) → torch device for the
+# sentence-transformers path. DirectML has no torch equivalent.
+_TORCH_DEVICE_MAP = {"cpu": "cpu", "cuda": "cuda", "coreml": "mps"}
+
 _EF_CACHE: dict = {}
 # Check-then-construct on the cache must be atomic: without it, two threads
 # resolving the same key each keep their own EF instance, and each instance
 # later lazy-loads its own copy of the model.
 _EF_CACHE_LOCK = threading.Lock()
 _WARNED: set = set()
+
+
+def is_sentence_transformer_model(model: Optional[str]) -> bool:
+    """True when ``model`` names a sentence-transformers checkpoint.
+
+    Any value other than the built-in ``minilm`` / ``embeddinggemma``
+    identifiers (and empty/unset, which mean minilm) is routed to the
+    sentence-transformers path — e.g. ``intfloat/multilingual-e5-base``,
+    ``BAAI/bge-m3``, or a local checkpoint path.
+    """
+    if not model:
+        return False
+    return str(model).strip().lower() not in _BUILTIN_MODELS
+
+
+class EmbeddingDependencyError(ImportError):
+    """A configured embedding model needs a package that is not installed.
+
+    A dedicated subclass so error arms in mcp_server / searcher / layers can
+    match *this* failure specifically — a bare ``except ImportError`` would
+    also swallow unrelated import failures (e.g. a missing backend driver
+    like ``pymilvus``) and mislabel them with the ``[multilingual]`` hint.
+    """
+
+
+class EmbeddingModelError(RuntimeError):
+    """The configured sentence-transformers model failed to load.
+
+    Wraps download / checkout failures (bad model id, no network, corrupt
+    cache) with the model name and recovery options, so the raw huggingface
+    error does not surface bare — and is never silently swallowed into a
+    fallback to the default model.
+    """
+
+
+def _sentence_transformers_available() -> bool:
+    """Cheap availability probe for the ``sentence_transformers`` package.
+
+    Checks ``sys.modules`` first (also lets tests stub the module in or
+    block it with a ``None`` entry), then falls back to ``find_spec`` — a
+    metadata lookup, NOT an import, so callers on startup-budget paths
+    (init, collection open) don't pay the multi-second torch import just
+    to learn the package exists.
+    """
+    mod = sys.modules.get("sentence_transformers")
+    if mod is not None:
+        return True
+    if "sentence_transformers" in sys.modules:
+        # Explicit None entry — the import is blocked.
+        return False
+    try:
+        return importlib.util.find_spec("sentence_transformers") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def ensure_model_dependencies(model: Optional[str]) -> None:
+    """Raise :class:`EmbeddingDependencyError` when ``model`` needs packages
+    that are not installed. Cheap — a metadata probe, no import, no download.
+
+    The probe targets ``sentence_transformers`` directly: chromadb's
+    ``SentenceTransformerEmbeddingFunction.__init__`` converts the
+    underlying ``ImportError`` into a bare ``ValueError``, which callers
+    cannot distinguish from a real configuration error. ``init --model``
+    calls this up front so a missing dependency fails *init* loudly rather
+    than surfacing mid-mine (or worse, being swallowed into a silent
+    fallback that binds the palace to the wrong model — PR #442 review).
+    """
+    if not is_sentence_transformer_model(model):
+        return
+    if not _sentence_transformers_available():
+        raise EmbeddingDependencyError(
+            f"embedding_model={str(model).strip()!r} requires the "
+            "sentence-transformers package, which is not installed.\n"
+            "  Install it with: pip install 'mempalace[multilingual]'\n"
+            "  Or revert embedding_model to a built-in value "
+            "('minilm' / 'embeddinggemma')."
+        )
+
+
+def _resolve_torch_device(device: Optional[str]) -> str:
+    """Map the configured ``embedding_device`` to a torch device string.
+
+    The config vocabulary is ONNX-provider-shaped (``auto`` / ``cpu`` /
+    ``cuda`` / ``coreml`` / ``dml``); sentence-transformers runs on torch,
+    so ``coreml`` maps to ``mps`` and ``dml`` (no torch equivalent) falls
+    back to CPU with a one-shot warning — the same fallback-not-fail policy
+    as :func:`_resolve_providers`.
+    """
+    normalized = (device or "auto").strip().lower()
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+
+    cuda_ok = torch.cuda.is_available()
+    # torch.backends.mps.is_available() returns True on Intel Macs where MPS
+    # does not actually work — require arm64 as well.
+    mps_backend = getattr(torch.backends, "mps", None)
+    mps_ok = (
+        mps_backend is not None and mps_backend.is_available() and platform.machine() == "arm64"
+    )
+
+    if normalized == "auto":
+        if cuda_ok:
+            return "cuda"
+        if mps_ok:
+            return "mps"
+        return "cpu"
+
+    mapped = _TORCH_DEVICE_MAP.get(normalized)
+    if mapped == "cuda" and cuda_ok:
+        return "cuda"
+    if mapped == "mps" and mps_ok:
+        return "mps"
+    if mapped != "cpu":
+        warn_key = f"torch:{normalized}"
+        if warn_key not in _WARNED:
+            logger.warning(
+                "embedding_device=%r is not available on the "
+                "sentence-transformers (torch) path — falling back to CPU.",
+                normalized,
+            )
+            _WARNED.add(warn_key)
+    return "cpu"
+
+
+class _LazySentenceTransformerEF:
+    """Defers chromadb's ``SentenceTransformerEmbeddingFunction`` to first use.
+
+    The chromadb wrapper's ``__init__`` imports torch and loads the model
+    eagerly. Collections are opened on paths that never embed (MCP status,
+    hooks, wake-up) and must stay inside the startup budgets, so the load is
+    deferred to the first embed call — same lazy contract as the built-in
+    :class:`EmbeddinggemmaONNX`. ``name()`` matches the real chromadb class
+    so collections created by either open interchangeably.
+
+    Construction failures at load time (bad model id, no network) are
+    wrapped in :class:`EmbeddingModelError` with recovery options — never
+    silently replaced with the default model.
+    """
+
+    @staticmethod
+    def name() -> str:
+        return "sentence_transformer"
+
+    def __init__(self, model_name: str, device: str):
+        self._model_name = model_name
+        self._device = device
+        self._inner = None
+        # Shared across threads via _EF_CACHE; serialize the one-time load.
+        self._load_lock = threading.Lock()
+
+    def _load(self):
+        if self._inner is not None:
+            return self._inner
+        with self._load_lock:
+            if self._inner is not None:
+                return self._inner
+            ensure_model_dependencies(self._model_name)
+            from chromadb.utils.embedding_functions import (
+                SentenceTransformerEmbeddingFunction,
+            )
+
+            try:
+                inner = SentenceTransformerEmbeddingFunction(
+                    model_name=self._model_name,
+                    device=self._device,
+                )
+            except Exception as e:
+                raise EmbeddingModelError(
+                    f"Failed to load sentence-transformers model "
+                    f"{self._model_name!r} (device={self._device!r}): {e}\n"
+                    "  Check the model id and network access, or revert "
+                    "embedding_model to a built-in value "
+                    "('minilm' / 'embeddinggemma')."
+                ) from e
+            self._inner = inner
+        return self._inner
+
+    def __call__(self, input):  # noqa: A002 — ChromaDB EF protocol
+        return self._load()(input)
+
+    def embed_query(self, input):  # noqa: A002 — ChromaDB EF protocol
+        """Embed query documents (ChromaDB EF protocol)."""
+        return self(input)
+
+    def embed_documents(self, input):  # noqa: A002
+        """Embed a batch of documents (ChromaDB EF protocol)."""
+        return self(input)
+
+
+def _build_sentence_transformer_ef(model: str, device: Optional[str]):
+    """Build the lazy sentence-transformers EF for ``model``.
+
+    Dependency check runs eagerly (actionable
+    :class:`EmbeddingDependencyError`, cheap metadata probe); the model
+    itself downloads / loads on the first embed call via
+    :class:`_LazySentenceTransformerEF`.
+    """
+    ensure_model_dependencies(model)
+
+    return _LazySentenceTransformerEF(
+        model_name=str(model).strip(),
+        device=_resolve_torch_device(device),
+    )
 
 
 def _resolve_providers(device: str) -> tuple[list, str]:
@@ -377,8 +605,16 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         if model is None:
             model = cfg.embedding_model
 
-    providers, effective = _resolve_providers(device)
-    cache_key = (model, tuple(providers))
+    if is_sentence_transformer_model(model):
+        # torch runtime — the ONNX provider list is meaningless here, so the
+        # cache key carries the resolved torch device instead.
+        providers = None
+        effective = _resolve_torch_device(device)
+        runtime = ("torch", effective)
+    else:
+        providers, effective = _resolve_providers(device)
+        runtime = tuple(providers)
+    cache_key = (model, runtime)
     cached = _EF_CACHE.get(cache_key)  # lock-free fast path; dict.get is GIL-atomic
     if cached is not None:
         return cached
@@ -387,34 +623,45 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         if cached is not None:
             return cached
 
-        threads = _resolve_intra_op_threads()
-        if model == "embeddinggemma":
+        if providers is None:
+            ef = _build_sentence_transformer_ef(model, device)
+        elif model == "embeddinggemma":
+            threads = _resolve_intra_op_threads()
             ef = EmbeddinggemmaONNX(preferred_providers=providers, intra_op_num_threads=threads)
         else:
-            # Default: minilm (or anything we don't recognize — back-compat win).
+            # Default: minilm (empty / legacy-unset values land here).
+            threads = _resolve_intra_op_threads()
             ef_cls = _build_ef_class()
             ef = ef_cls(preferred_providers=providers, intra_op_num_threads=threads)
 
         _EF_CACHE[cache_key] = ef
     logger.info(
-        "Embedding function initialized (model=%s device=%s providers=%s)",
+        "Embedding function initialized (model=%s device=%s runtime=%s)",
         model,
         effective,
-        providers,
+        runtime,
     )
     return ef
 
 
-def describe_device(device: Optional[str] = None) -> str:
+def describe_device(device: Optional[str] = None, model: Optional[str] = None) -> str:
     """Return a short human-readable label for the resolved device.
 
     Used by the miner CLI header so users can see at a glance whether GPU
-    acceleration actually engaged.
+    acceleration actually engaged. Model-aware: sentence-transformers models
+    run on torch, so the label is the resolved torch device (``mps`` rather
+    than ``coreml``), not an ONNX provider name.
     """
-    if device is None:
+    if device is None or model is None:
         from .config import MempalaceConfig
 
-        device = MempalaceConfig().embedding_device
+        cfg = MempalaceConfig()
+        if device is None:
+            device = cfg.embedding_device
+        if model is None:
+            model = cfg.embedding_model
+    if is_sentence_transformer_model(model):
+        return _resolve_torch_device(device)
     _, effective = _resolve_providers(device)
     return effective
 
@@ -428,13 +675,19 @@ def current_model_name(model: Optional[str] = None) -> str:
     """Resolve the canonical embedder model name (cheap, no model load).
 
     This is the configured ``embedding_model`` (``"minilm"`` /
-    ``"embeddinggemma"`` / ...), not the embedding function's internal
-    ``name()`` (which is spoofed to ``"default"`` for ChromaDB compatibility).
+    ``"embeddinggemma"`` / a sentence-transformers id), not the embedding
+    function's internal ``name()`` (which is spoofed to ``"default"`` for
+    ChromaDB compatibility). Normalization matches
+    ``MempalaceConfig._normalize_embedding_model`` in BOTH branches —
+    builtins lowercase, everything else verbatim — so the identity recorded
+    at mine time (from config) and one derived from an explicit ``model``
+    argument (e.g. ``palace set-embedder --model``) can never disagree on
+    case alone.
     """
-    if model is not None:
-        return str(model).strip().lower()
     from .config import MempalaceConfig
 
+    if model is not None:
+        return MempalaceConfig._normalize_embedding_model(model)
     return MempalaceConfig().embedding_model
 
 

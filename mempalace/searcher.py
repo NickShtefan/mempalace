@@ -24,6 +24,7 @@ from .backends import (
     UnsupportedCapabilityError,
 )
 from .config import sqlite_read_uri
+from .embedding import EmbeddingDependencyError
 from .palace import (
     _open_collection_or_explain,
     get_closets_collection,
@@ -1088,6 +1089,19 @@ def _open_search_collection(palace_path: str, collection_name: str):
             "error": "Backend error",
             "details": str(e),
             "hint": "Check the selected backend configuration and availability.",
+        }
+    except EmbeddingDependencyError as e:
+        # Without this arm the generic handler below reports "No palace
+        # found" and steers the agent toward re-init/re-mine — which would
+        # fail on the same missing package. Surface the install hint instead
+        # (#442 review: the MCP search path must not bury actionable
+        # embedding errors).
+        logger.error("Embedding dependency missing opening palace at %s: %s", palace_path, e)
+        return None, {
+            "error": "Embedding dependency missing",
+            "details": str(e),
+            "hint": "Run: pip install 'mempalace[multilingual]' "
+            "(or revert embedding_model to 'minilm' / 'embeddinggemma').",
         }
     except Exception as e:
         logger.error("No palace found at %s: %s", palace_path, e)
